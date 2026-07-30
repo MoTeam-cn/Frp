@@ -23,6 +23,10 @@ name: Sync Upstream Tag
 #     改用 git merge refs/tags/$TAG
 #   - GITHUB_TOKEN 推送的 tag 不会触发其他工作流的 on.push 事件
 #     （GitHub 防递归机制），改用 gh workflow run 主动触发 goreleaser.yml
+#   - git fetch upstream --tags 会把上游所有 tag 拉到本地 refs/tags/，
+#     后续 git push origin dev 时即使 --no-follow-tags 也可能批量推送，
+#     与 origin 已有 tag 冲突。改为 git fetch upstream master --no-tags
+#     只拉 master 分支，目标 tag 在 Sync 步骤用 git fetch upstream tag $TAG 单独拉取
 
 on:
   schedule:
@@ -68,8 +72,11 @@ jobs:
       - name: Add upstream remote
         run: |
           git remote add upstream https://github.com/fatedier/frp.git
-          # 只 fetch 上游的 tag 和 master 分支引用，不 fetch 全部分支
-          git fetch upstream --tags --no-recurse-submodules
+          # 只 fetch 上游 master 分支，不 fetch tag
+          # （git fetch upstream --tags 会把上游所有 tag 拉到本地 refs/tags/，
+          #  后续 git push origin dev 时即使 --no-follow-tags 也可能批量推送，
+          #  与 origin 已有 tag 冲突。改为只 fetch master，目标 tag 在 Sync 步骤单独 fetch）
+          git fetch upstream master --no-tags --no-recurse-submodules
 
       - name: Determine target tag
         id: target
@@ -100,9 +107,7 @@ jobs:
           echo "上游目标 tag: $TARGET_TAG"
 
           # 检查本仓库（origin 远程）是否已存在该 tag
-          # 注意：不能用 git rev-parse --verify refs/tags/$TARGET_TAG，
-          # 因为 git fetch upstream --tags 会把上游 tag 拉到本地 refs/tags/，
-          # 导致检查始终为 true。必须用 git ls-remote 检查 origin 远程。
+          # 用 git ls-remote 检查 origin 远程，不依赖本地 refs/tags/
           if git ls-remote --tags origin | grep -q "refs/tags/${TARGET_TAG}$"; then
             if [ "$FORCE" = "true" ]; then
               echo "::notice::tag $TARGET_TAG 已存在于 origin，强制同步模式"
@@ -135,7 +140,11 @@ jobs:
           # 上游无此文件，需备份后还原
           cp Makefile.cross-compiles /tmp/protected/Makefile.cross-compiles 2>/dev/null || true
 
-          # 2. 合并上游 tag 到 dev（-X theirs：冲突时上游获胜）
+          # 2. 只 fetch 目标 tag（不拉上游所有 tag，避免 git push 时批量推送冲突）
+          #    git fetch upstream tag $TAG 只在本地创建 refs/tags/$TAG，不影响其他 tag
+          git fetch upstream tag "$TARGET_TAG" --no-recurse-submodules
+
+          # 3. 合并上游 tag 到 dev（-X theirs：冲突时上游获胜）
           #    注意：tag 引用是 refs/tags/$TAG，不是 upstream/$TAG（那是分支引用）
           #    --allow-unrelated-histories：允许合并无共同历史的分支（保险起见保留）
           git merge "refs/tags/$TARGET_TAG" \
@@ -148,20 +157,20 @@ jobs:
             git commit --no-edit || true
           }
 
-          # 3. 还原受保护文件
+          # 4. 还原受保护文件
           mkdir -p .github/workflows hack
           cp -r /tmp/protected/.github/workflows/* .github/workflows/
           cp /tmp/protected/README.md .
           cp /tmp/protected/hack/ci-upload.cjs hack/ci-upload.cjs 2>/dev/null || true
           cp /tmp/protected/Makefile.cross-compiles Makefile.cross-compiles 2>/dev/null || true
 
-          # 4. 确保 README_zh.md 保持删除状态（上游可能恢复它）
+          # 5. 确保 README_zh.md 保持删除状态（上游可能恢复它）
           if [ -f README_zh.md ]; then
             git rm -f README_zh.md
             echo "::notice::已删除上游恢复的 README_zh.md"
           fi
 
-          # 5. 提交受保护文件的还原
+          # 6. 提交受保护文件的还原
           git add -A
           if ! git diff --staged --quiet; then
             git commit -m "chore: preserve MoTeam customizations for $TARGET_TAG
@@ -176,10 +185,10 @@ jobs:
             echo "::notice::受保护文件无需还原"
           fi
 
-          # 6. 推送 dev 分支（--no-follow-tags：只推分支，tag 由下一步单独推送）
+          # 7. 推送 dev 分支（--no-follow-tags：只推分支，tag 由下一步单独推送）
           git push --no-follow-tags origin dev
 
-          # 7. 创建并推送同名 tag
+          # 8. 创建并推送同名 tag
           #    如果 tag 已存在（force 模式），用 -f 强制覆盖
           git tag -f "$TARGET_TAG"
           git push origin "$TARGET_TAG" --force
