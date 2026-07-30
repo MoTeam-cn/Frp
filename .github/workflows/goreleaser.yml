@@ -5,7 +5,7 @@ name: Release
 #   1. 构建 frps/frpc web 资产
 #   2. 调用 Makefile.cross-compiles 跨平台编译 frpc + frps 二进制
 #   3. 按 (component, platform, arch) 重组为独立压缩包
-#   4. 通过 ci-upload.sh 上传到 S3 并注册到 apiServer（MoSign-v2 鉴权）
+#   4. 通过 ci-upload.cjs 上传到 S3 并注册到 apiServer（MoSign-v2 鉴权）
 #   5. 在 MoTeam-cn/Frp 创建 GitHub Release 并上传全部压缩包资产（与 S3 同步）
 
 on:
@@ -64,9 +64,6 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: '${{ env.NODE_VERSION }}'
-
-      - name: Make ci-upload.sh executable
-        run: chmod +x ./hack/ci-upload.sh
 
       - name: Build web assets (frps + frpc)
         run: make web-ci
@@ -167,7 +164,7 @@ jobs:
               ARCHIVE_PATH="./release/packages/${ARCHIVE_FILE}"
 
               # 3. 上传到 apiServer
-              if ./hack/ci-upload.sh \
+              if node ./hack/ci-upload.cjs \
                   "$VERSION" \
                   "$COMPONENT" \
                   "$DST_PLATFORM" \
