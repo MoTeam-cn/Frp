@@ -135,6 +135,9 @@ NONCE=$(echo "$SIGN_INFO" | cut -d'|' -f2)
 SIGNATURE=$(echo "$SIGN_INFO" | cut -d'|' -f3)
 
 echo "请求预签名上传 URL..."
+# 注意：必须使用 --data-binary @file 而非 -d @file
+# curl -d @file 会剥离文件中的 \r 和 \n，导致服务端收到的 body 与脚本计算 SHA256 的原文不一致，
+# 进而 MoSign-v2 签名校验失败。--data-binary 保留原始字节，保证两端 SHA256 一致。
 HTTP_STATUS=$(curl -sS -o /tmp/presign-response.json -w "%{http_code}" \
   -X POST "${API_BASE_URL}/v3/ci/frp/presign-upload" \
   -H "Content-Type: application/json" \
@@ -142,7 +145,7 @@ HTTP_STATUS=$(curl -sS -o /tmp/presign-response.json -w "%{http_code}" \
   -H "X-MoSign-Timestamp: ${TIMESTAMP}" \
   -H "X-MoSign-Nonce: ${NONCE}" \
   -H "X-MoSign-Signature: ${SIGNATURE}" \
-  -d @/tmp/presign-payload.json)
+  --data-binary @/tmp/presign-payload.json)
 
 if [ "$HTTP_STATUS" != "200" ]; then
   echo "::error::预签名请求失败 (HTTP $HTTP_STATUS):"
@@ -209,7 +212,7 @@ HTTP_STATUS=$(curl -sS -o /tmp/register-response.txt -w "%{http_code}" \
   -H "X-MoSign-Timestamp: ${TIMESTAMP}" \
   -H "X-MoSign-Nonce: ${NONCE}" \
   -H "X-MoSign-Signature: ${SIGNATURE}" \
-  -d @/tmp/release-payload.json)
+  --data-binary @/tmp/release-payload.json)
 
 if [ "$HTTP_STATUS" != "200" ]; then
   echo "::error::版本注册失败 (HTTP $HTTP_STATUS):"
