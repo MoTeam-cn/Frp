@@ -96,27 +96,54 @@ FILE_HASH="sha256:$FILE_SHA256"
 
 echo "::group::上传 $COMPONENT $VERSION $PLATFORM/$ARCH ($FILENAME, $FILE_SIZE bytes)"
 
+# 调试输出：key 长度和前缀（不泄露完整 key，用于对比云端配置）
+echo "  [debug] push_key length=${#MOLAUNCH_ACTION_PUSH_KEY}" >&2
+echo "  [debug] push_key prefix=${MOLAUNCH_ACTION_PUSH_KEY:0:8}..." >&2
+
 # ===== MoSign-v2 签名函数 =====
 # 输出格式：timestamp|nonce|signature
+#
+# 用 Node 的 crypto 模块计算 SHA256 和 HMAC，避免 shell/openssl 版本差异：
+# - openssl dgst -sha256 -r 的 -r（BSD 格式）在不同 openssl 版本输出不一致
+# - openssl dgst -sha256 -hmac 在某些版本可能把 key 当作选项参数
+# - Node crypto 行为确定，且 key 通过环境变量传递，不泄露到进程列表
 sign_request() {
   local method="$1"
   local path="$2"
   local body_file="$3"
-  local timestamp nonce body_sha256 string_to_sign signature
 
-  timestamp=$(date +%s)
-  nonce=$(openssl rand -hex 16)
-  body_sha256=$(openssl dgst -sha256 -r "$body_file" | awk '{print $1}')
+  MOLAUNCH_ACTION_PUSH_KEY="${MOLAUNCH_ACTION_PUSH_KEY}" node -e '
+    const crypto = require("crypto");
+    const fs = require("fs");
 
-  # string-to-sign = METHOD\nPATH\nTIMESTAMP\nNONCE\nBODY_SHA256_HEX
-  string_to_sign=$(printf "%s\n%s\n%s\n%s\n%s" \
-    "$method" "$path" "$timestamp" "$nonce" "$body_sha256")
+    const method = process.argv[1];
+    const path = process.argv[2];
+    const bodyFile = process.argv[3];
+    const key = process.env.MOLAUNCH_ACTION_PUSH_KEY;
 
-  signature=$(printf "%s" "$string_to_sign" \
-    | openssl dgst -sha256 -hmac "${MOLAUNCH_ACTION_PUSH_KEY}" \
-    | awk '{print $NF}')
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const nonce = crypto.randomBytes(16).toString("hex");
+    const body = fs.readFileSync(bodyFile);
+    const bodySha256 = crypto.createHash("sha256").update(body).digest("hex");
 
-  echo "${timestamp}|${nonce}|${signature}"
+    // string-to-sign = METHOD\nPATH\nTIMESTAMP\nNONCE\nBODY_SHA256_HEX
+    // 注意：末尾不加换行，与服务端 format!() 一致
+    const stringToSign = [method, path, timestamp, nonce, bodySha256].join("\n");
+    const signature = crypto.createHmac("sha256", key).update(stringToSign).digest("hex");
+
+    // 调试输出到 stderr（不干扰 stdout 的正式输出）
+    console.error("[sign-debug] method=" + method);
+    console.error("[sign-debug] path=" + path);
+    console.error("[sign-debug] timestamp=" + timestamp);
+    console.error("[sign-debug] nonce=" + nonce);
+    console.error("[sign-debug] body_sha256=" + bodySha256);
+    console.error("[sign-debug] body_size=" + body.length);
+    console.error("[sign-debug] key_length=" + key.length);
+    console.error("[sign-debug] signature=" + signature);
+
+    // 正式输出到 stdout：timestamp|nonce|signature
+    console.log(timestamp + "|" + nonce + "|" + signature);
+  ' "$method" "$path" "$body_file"
 }
 
 # ===== Step 1: 获取 S3 预签名 PUT URL =====
@@ -149,16 +176,33 @@ HTTP_STATUS=$(curl -sS -o /tmp/presign-response.json -w "%{http_code}" \
 
 if [ "$HTTP_STATUS" != "200" ]; then
   echo "::error::预签名请求失败 (HTTP $HTTP_STATUS):"
-  cat /tmp/presign-response.json
+  cat /tmp/presign-response.json >&2
   exit 1
 fi
 
 # 解析响应（使用 Node 跨平台兼容，无需 jq）
+# 注意：apiServer 设计为 HTTP 200 + body.code 区分业务错误，
+# 所以 HTTP 200 也可能是签名校验失败（code=1004），需检查 body.code
 node <<'NODE_SCRIPT'
 const fs = require('fs');
-const resp = JSON.parse(fs.readFileSync('/tmp/presign-response.json', 'utf8'));
-if (resp.code !== 1 || !resp.data || !Array.isArray(resp.data.uploads) || resp.data.uploads.length === 0) {
-  console.error('::error::预签名响应格式异常:', JSON.stringify(resp));
+const raw = fs.readFileSync('/tmp/presign-response.json', 'utf8');
+let resp;
+try {
+  resp = JSON.parse(raw);
+} catch (e) {
+  console.error('::error::预签名响应非 JSON：' + raw);
+  process.exit(1);
+}
+
+// 业务错误（如 code=1004 签名校验失败）→ 打印完整响应到 stderr，方便排查
+if (resp.code !== 1) {
+  console.error('::error::预签名业务错误 (code=' + resp.code + '): ' + (resp.msg || ''));
+  console.error('完整响应：' + raw);
+  process.exit(1);
+}
+
+if (!resp.data || !Array.isArray(resp.data.uploads) || resp.data.uploads.length === 0) {
+  console.error('::error::预签名响应格式异常: ' + raw);
   process.exit(1);
 }
 const item = resp.data.uploads[0];
