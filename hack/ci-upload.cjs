@@ -139,8 +139,6 @@ async function main() {
   const FILE_HASH = `sha256:${FILE_SHA256}`;
 
   console.log(`::group::上传 ${COMPONENT} ${VERSION} ${PLATFORM}/${ARCH} (${FILENAME}, ${FILE_SIZE} bytes)`);
-  console.log(`  [debug] push_key length=${PUSH_KEY.length}`);
-  console.log(`  [debug] push_key prefix=${PUSH_KEY.substring(0, 8)}...`);
 
   // ===== Step 1: 获取 S3 预签名 PUT URL =====
   // body 用 JSON.stringify 生成，签名和请求共用同一个 Buffer，保证 SHA256 一致
