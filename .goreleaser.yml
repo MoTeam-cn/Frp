@@ -6,11 +6,12 @@ checksum:
   extra_files:
   - glob: ./release/packages/*
 release:
-  # Same as for github
-  # Note: it can only be one: either github, gitlab or gitea
+  # 同步目标仓库：MoTeam-cn/Frp（fork 自 fatedier/frp）
+  # 注意：实际发布流程见 .github/workflows/goreleaser.yml（已不依赖此配置），
+  #       本文件仅保留供本地手动运行 goreleaser CLI 时使用。
   github:
-    owner: fatedier
-    name: frp
+    owner: MoTeam-cn
+    name: Frp
 
   draft: false
 

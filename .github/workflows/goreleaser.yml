@@ -1,38 +1,246 @@
-name: goreleaser
+name: Release
+
+# 通过 tag 推送触发（由 sync-upstream.yml 自动同步上游 tag 后触发，或手动推送 tag）
+# 流程：
+#   1. 构建 frps/frpc web 资产
+#   2. 调用 Makefile.cross-compiles 跨平台编译 frpc + frps 二进制
+#   3. 按 (component, platform, arch) 重组为独立压缩包
+#   4. 通过 ci-upload.sh 上传到 S3 并注册到 apiServer（MoSign-v2 鉴权）
+#   5. 在 MoTeam-cn/Frp 创建 GitHub Release（仅历史归档，不作为下载源）
 
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: '指定已存在的 tag 进行构建（仅 workflow_dispatch 模式）'
+        required: false
+        default: ''
+
+env:
+  GO_VERSION: '1.25'
+  NODE_VERSION: '22'
+  API_BASE_URL: https://api.molaunch.moiu.cn
+
+permissions:
+  contents: write
 
 jobs:
-  goreleaser:
+  build-and-upload:
+    name: Build & Upload
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # workflow_dispatch 模式下支持指定 tag
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          # 去掉 v 前缀
+          VERSION="${TAG#v}"
+          echo "TAG=$TAG" >> $GITHUB_OUTPUT
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Parsed tag=$TAG version=$VERSION"
 
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.25'
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '22'
-      - name: Build web assets (frps)
-        run: make build
-        working-directory: web/frps
-      - name: Build web assets (frpc)
-        run: make build
-        working-directory: web/frpc
-      - name: Make All
-        run: |
-          ./package.sh
+          go-version: '${{ env.GO_VERSION }}'
+          cache: false
 
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v7
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
         with:
-          version: latest
-          args: release --clean --release-notes=./Release.md
+          node-version: '${{ env.NODE_VERSION }}'
+
+      - name: Make ci-upload.sh executable
+        run: chmod +x ./hack/ci-upload.sh
+
+      - name: Build web assets (frps + frpc)
+        run: make web-ci
+
+      - name: Cross-compile frpc + frps
+        run: make -f ./Makefile.cross-compiles
+
+      - name: Verify build artifacts
+        run: |
+          echo "::group::release 目录内容"
+          ls -la ./release/ || true
+          echo "::endgroup::"
+
+          # 至少应该有 6 个平台 × 2 个组件 = 12 个文件
+          FILE_COUNT=$(ls ./release/frp[cs]_* 2>/dev/null | wc -l)
+          if [ "$FILE_COUNT" -lt 12 ]; then
+            echo "::error::编译产物不足（期望 ≥12，实际 $FILE_COUNT）"
+            exit 1
+          fi
+          echo "编译产物 $FILE_COUNT 个，校验通过"
+
+      - name: Repackage and upload to apiServer
+        id: upload
         env:
-          GITHUB_TOKEN: ${{ secrets.GPR_TOKEN }}
+          MOLAUNCH_ACTION_PUSH_KEY: ${{ secrets.MOLAUNCH_ACTION_PUSH_KEY }}
+          API_BASE_URL: ${{ env.API_BASE_URL }}
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          TAG="${{ steps.version.outputs.TAG }}"
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${TAG}"
+          RELEASE_NOTES="Frp $VERSION - 自动同步自上游 fatedier/frp"
+
+          # 平台/架构映射表（Makefile 命名 -> apiServer 命名）
+          # 格式：source_os:source_arch:target_platform:target_arch
+          TARGETS=(
+            "darwin:amd64:macos:x86_64"
+            "darwin:arm64:macos:aarch64"
+            "linux:amd64:linux:x86_64"
+            "linux:arm64:linux:aarch64"
+            "windows:amd64:windows:x86_64"
+            "windows:arm64:windows:aarch64"
+          )
+
+          # 清理并创建打包目录
+          rm -rf ./release/packages
+          mkdir -p ./release/packages
+
+          # 读取 Release.md 作为更新日志（若存在）
+          if [ -f ./Release.md ]; then
+            RELEASE_NOTES=$(cat ./Release.md | head -c 4096)
+          fi
+
+          FAILED_COUNT=0
+          UPLOADED_COUNT=0
+          UPLOAD_LIST=""
+
+          for target in "${TARGETS[@]}"; do
+            IFS=':' read -r SRC_OS SRC_ARCH DST_PLATFORM DST_ARCH <<< "$target"
+
+            for COMPONENT in client server; do
+              BIN_NAME="frp${COMPONENT:0:1}"  # frpc or frps
+              SRC_BIN="./release/${BIN_NAME}_${SRC_OS}_${SRC_ARCH}"
+              ARCHIVE_NAME="frp_${COMPONENT}_${VERSION}_${DST_PLATFORM}_${DST_ARCH}"
+              PKG_DIR="./release/packages/${ARCHIVE_NAME}"
+
+              # Windows 二进制有 .exe 后缀
+              if [ "$SRC_OS" = "windows" ]; then
+                SRC_BIN="${SRC_BIN}.exe"
+                BIN_FILE="${BIN_NAME}.exe"
+                ARCHIVE_FILE="${ARCHIVE_NAME}.zip"
+              else
+                BIN_FILE="${BIN_NAME}"
+                ARCHIVE_FILE="${ARCHIVE_NAME}.tar.gz"
+              fi
+
+              if [ ! -f "$SRC_BIN" ]; then
+                echo "::warning::二进制不存在，跳过: $SRC_BIN"
+                FAILED_COUNT=$((FAILED_COUNT + 1))
+                continue
+              fi
+
+              # 1. 创建临时目录，放入二进制 + LICENSE + 配置
+              mkdir -p "$PKG_DIR"
+              cp "$SRC_BIN" "${PKG_DIR}/${BIN_FILE}"
+              cp LICENSE "${PKG_DIR}/"
+              cp "conf/${BIN_NAME}.toml" "${PKG_DIR}/" 2>/dev/null || true
+
+              # 2. 打包
+              pushd ./release/packages >/dev/null
+              if [ "$SRC_OS" = "windows" ]; then
+                zip -rq "${ARCHIVE_FILE}" "${ARCHIVE_NAME}"
+              else
+                tar -zcf "${ARCHIVE_FILE}" "${ARCHIVE_NAME}"
+              fi
+              popd >/dev/null
+              rm -rf "$PKG_DIR"
+
+              ARCHIVE_PATH="./release/packages/${ARCHIVE_FILE}"
+
+              # 3. 上传到 apiServer
+              if ./hack/ci-upload.sh \
+                  "$VERSION" \
+                  "$COMPONENT" \
+                  "$DST_PLATFORM" \
+                  "$DST_ARCH" \
+                  "$ARCHIVE_PATH" \
+                  "$RELEASE_NOTES" \
+                  "$RELEASE_URL"; then
+                UPLOADED_COUNT=$((UPLOADED_COUNT + 1))
+                UPLOAD_LIST="${UPLOAD_LIST}- ✅ \`${COMPONENT}\` \`${DST_PLATFORM}/${DST_ARCH}\` (\`${ARCHIVE_FILE}\`)
+          "
+                echo "✓ $COMPONENT $VERSION $DST_PLATFORM/$DST_ARCH"
+              else
+                FAILED_COUNT=$((FAILED_COUNT + 1))
+                UPLOAD_LIST="${UPLOAD_LIST}- ❌ \`${COMPONENT}\` \`${DST_PLATFORM}/${DST_ARCH}\`（上传失败）
+          "
+                echo "::error::$COMPONENT $VERSION $DST_PLATFORM/$DST_ARCH 上传失败"
+              fi
+            done
+          done
+
+          echo "::group::上传结果"
+          echo "成功：$UPLOADED_COUNT 个"
+          echo "失败：$FAILED_COUNT 个"
+          echo "::endgroup::"
+
+          # 输出到 step output 供 Summary 步骤使用（多行需用 EOF）
+          {
+            echo "uploaded_count=$UPLOADED_COUNT"
+            echo "failed_count=$FAILED_COUNT"
+            echo "release_url=$RELEASE_URL"
+            echo "upload_list<<EOF"
+            echo "$UPLOAD_LIST"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+          if [ "$FAILED_COUNT" -gt 0 ]; then
+            echo "::error::有 $FAILED_COUNT 个上传失败"
+            exit 1
+          fi
+
+      - name: Create GitHub Release (history archive)
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Frp ${{ steps.version.outputs.VERSION }}
+          tag_name: ${{ steps.version.outputs.TAG }}
+          body: |
+            ## Frp ${{ steps.version.outputs.VERSION }}
+
+            ### Downloads
+            二进制文件已上传至 apiServer S3 存储桶，客户端可通过启动器联机功能自动获取。
+            本页面仅作为发布历史归档。
+
+            ### Source
+            本仓库自动同步自上游 [fatedier/frp](https://github.com/fatedier/frp) 对应 tag。
+          draft: false
+          prerelease: false
+          # 不上传任何资产到 GitHub Release（资产在 S3）
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Frp 发布结果"
+            echo ""
+            echo "- **版本**：\`${{ steps.version.outputs.VERSION }}\`（tag: \`${{ steps.version.outputs.TAG }}\`）"
+            echo "- **apiServer**：\`${{ env.API_BASE_URL }}\`"
+            echo "- **资产归档**：[GitHub Release](${{ steps.upload.outputs.release_url }})"
+            echo ""
+            echo "### 上传详情（成功 ${{ steps.upload.outputs.uploaded_count }} / 失败 ${{ steps.upload.outputs.failed_count }}）"
+            echo ""
+            echo "${{ steps.upload.outputs.upload_list }}"
+            echo ""
+            echo "客户端可通过 \`GET /v1/frp/manifest?component=client&target=windows&arch=x86_64&current_version=0.0.0\` 查询最新版本。"
+          } >> $GITHUB_STEP_SUMMARY
