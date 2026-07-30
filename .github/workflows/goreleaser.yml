@@ -6,7 +6,7 @@ name: Release
 #   2. 调用 Makefile.cross-compiles 跨平台编译 frpc + frps 二进制
 #   3. 按 (component, platform, arch) 重组为独立压缩包
 #   4. 通过 ci-upload.sh 上传到 S3 并注册到 apiServer（MoSign-v2 鉴权）
-#   5. 在 MoTeam-cn/Frp 创建 GitHub Release（仅历史归档，不作为下载源）
+#   5. 在 MoTeam-cn/Frp 创建 GitHub Release 并上传全部压缩包资产（与 S3 同步）
 
 on:
   push:
@@ -208,7 +208,7 @@ jobs:
             exit 1
           fi
 
-      - name: Create GitHub Release (history archive)
+      - name: Create GitHub Release with assets
         uses: softprops/action-gh-release@v2
         with:
           name: Frp ${{ steps.version.outputs.VERSION }}
@@ -217,14 +217,21 @@ jobs:
             ## Frp ${{ steps.version.outputs.VERSION }}
 
             ### Downloads
-            二进制文件已上传至 apiServer S3 存储桶，客户端可通过启动器联机功能自动获取。
-            本页面仅作为发布历史归档。
+            二进制压缩包已同时上传至：
+            - **apiServer S3 存储桶**：供启动器联机功能自动拉取（presigned URL）
+            - **GitHub Release 资产**：供用户手动下载归档
+
+            ### 文件命名规范
+            - `frp_client_{version}_{platform}_{arch}.zip|tar.gz`：frpc 客户端
+            - `frp_server_{version}_{platform}_{arch}.zip|tar.gz`：frps 服务端
 
             ### Source
             本仓库自动同步自上游 [fatedier/frp](https://github.com/fatedier/frp) 对应 tag。
           draft: false
           prerelease: false
-          # 不上传任何资产到 GitHub Release（资产在 S3）
+          # 上传所有 per-component 压缩包到 GitHub Release（与 S3 同步）
+          files: |
+            release/packages/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -235,8 +242,8 @@ jobs:
             echo "## Frp 发布结果"
             echo ""
             echo "- **版本**：\`${{ steps.version.outputs.VERSION }}\`（tag: \`${{ steps.version.outputs.TAG }}\`）"
-            echo "- **apiServer**：\`${{ env.API_BASE_URL }}\`"
-            echo "- **资产归档**：[GitHub Release](${{ steps.upload.outputs.release_url }})"
+            echo "- **apiServer**：\`${{ env.API_BASE_URL }}\`（S3 presigned URL 分发）"
+            echo "- **GitHub Release**：[资产归档](${{ steps.upload.outputs.release_url }})（同步上传 12 个 per-component 压缩包）"
             echo ""
             echo "### 上传详情（成功 ${{ steps.upload.outputs.uploaded_count }} / 失败 ${{ steps.upload.outputs.failed_count }}）"
             echo ""
