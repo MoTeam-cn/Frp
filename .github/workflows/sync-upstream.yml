@@ -7,6 +7,7 @@ name: Sync Upstream Tag
 #      - .github/workflows/   自定义工作流
 #      - README.md            自定义版本
 #      - README_zh.md         已删除，确保不被上游恢复
+#      - hack/ci-upload.cjs   自定义 CI 上传脚本
 #   3. 主分支 dev 通过 merge -X theirs 合并上游代码，冲突时上游获胜，
 #      但受保护文件在合并后强制还原为本仓库版本
 #   4. 同步完成后 push dev 和 tag，并主动触发 goreleaser.yml 构建工作流
@@ -123,9 +124,12 @@ jobs:
           echo "::group::同步上游 tag $TARGET_TAG"
 
           # 1. 备份本仓库受保护文件
-          mkdir -p /tmp/protected/.github/workflows
+          mkdir -p /tmp/protected/.github/workflows /tmp/protected/hack
           cp -r .github/workflows/* /tmp/protected/.github/workflows/ 2>/dev/null || true
           cp README.md /tmp/protected/README.md
+          # hack/ci-upload.cjs 是 MoTeam 自定义的 CI 上传脚本（上游无此文件），
+          # merge -X theirs 时若上游有同名文件会覆盖，需备份后还原
+          cp hack/ci-upload.cjs /tmp/protected/hack/ci-upload.cjs 2>/dev/null || true
 
           # 2. 合并上游 tag 到 dev（-X theirs：冲突时上游获胜）
           #    注意：tag 引用是 refs/tags/$TAG，不是 upstream/$TAG（那是分支引用）
@@ -141,9 +145,10 @@ jobs:
           }
 
           # 3. 还原受保护文件
-          mkdir -p .github/workflows
+          mkdir -p .github/workflows hack
           cp -r /tmp/protected/.github/workflows/* .github/workflows/
           cp /tmp/protected/README.md .
+          cp /tmp/protected/hack/ci-upload.cjs hack/ci-upload.cjs 2>/dev/null || true
 
           # 4. 确保 README_zh.md 保持删除状态（上游可能恢复它）
           if [ -f README_zh.md ]; then
@@ -158,6 +163,7 @@ jobs:
 
           - 保留自定义 .github/workflows/
           - 保留修改后的 README.md
+          - 保留自定义 hack/ci-upload.cjs 上传脚本
           - 保持 README_zh.md 删除状态
           "
           else
