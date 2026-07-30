@@ -58,6 +58,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 禁用 followTags，避免 git push origin dev 时顺带推送上游拉下来的 tag
+          # （上游 tag 通过 git fetch upstream --tags 进入本地，merge 后变为 dev 可达，
+          # 若 followTags 启用会导致这些 tag 被批量推送，与 origin 已有 tag 冲突）
+          git config --global push.followTags false
 
       - name: Add upstream remote
         run: |
@@ -160,8 +164,8 @@ jobs:
             echo "::notice::受保护文件无需还原"
           fi
 
-          # 6. 推送 dev 分支
-          git push origin dev
+          # 6. 推送 dev 分支（--no-follow-tags：只推分支，tag 由下一步单独推送）
+          git push --no-follow-tags origin dev
 
           # 7. 创建并推送同名 tag
           #    如果 tag 已存在（force 模式），用 -f 强制覆盖
