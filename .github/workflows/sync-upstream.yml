@@ -1,13 +1,14 @@
 name: Sync Upstream Tag
 
-# 每小时检查上游 fatedier/frp 是否有新 tag，若有则同步到 MoTeam-cn/Frp。
+# 每 30 分钟检查上游 fatedier/frp 是否有新 tag，若有则同步到 MoTeam-cn/Frp。
 # 同步策略：
 #   1. 创建与上游同名的 tag，指向「上游 tag 提交 + 保留 MoTeam 自定义」的新提交
 #   2. 受保护文件（不被上游覆盖）：
-#      - .github/workflows/   自定义工作流
-#      - README.md            自定义版本
-#      - README_zh.md         已删除，确保不被上游恢复
-#      - hack/ci-upload.cjs   自定义 CI 上传脚本
+#      - .github/workflows/        自定义工作流
+#      - README.md                 自定义版本
+#      - README_zh.md              已删除，确保不被上游恢复
+#      - hack/ci-upload.cjs        自定义 CI 上传脚本
+#      - Makefile.cross-compiles   自定义跨平台编译目标（精简版）
 #   3. 主分支 dev 通过 merge -X theirs 合并上游代码，冲突时上游获胜，
 #      但受保护文件在合并后强制还原为本仓库版本
 #   4. 同步完成后 push dev 和 tag，并主动触发 goreleaser.yml 构建工作流
@@ -25,8 +26,8 @@ name: Sync Upstream Tag
 
 on:
   schedule:
-    # 每小时整点检查（UTC 时间）
-    - cron: '0 * * * *'
+    # 每 30 分钟检查一次（UTC 时间）
+    - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       tag:
@@ -130,6 +131,9 @@ jobs:
           # hack/ci-upload.cjs 是 MoTeam 自定义的 CI 上传脚本（上游无此文件），
           # merge -X theirs 时若上游有同名文件会覆盖，需备份后还原
           cp hack/ci-upload.cjs /tmp/protected/hack/ci-upload.cjs 2>/dev/null || true
+          # Makefile.cross-compiles 是精简版跨平台编译目标（只编译 6 个主流平台），
+          # 上游无此文件，需备份后还原
+          cp Makefile.cross-compiles /tmp/protected/Makefile.cross-compiles 2>/dev/null || true
 
           # 2. 合并上游 tag 到 dev（-X theirs：冲突时上游获胜）
           #    注意：tag 引用是 refs/tags/$TAG，不是 upstream/$TAG（那是分支引用）
@@ -149,6 +153,7 @@ jobs:
           cp -r /tmp/protected/.github/workflows/* .github/workflows/
           cp /tmp/protected/README.md .
           cp /tmp/protected/hack/ci-upload.cjs hack/ci-upload.cjs 2>/dev/null || true
+          cp /tmp/protected/Makefile.cross-compiles Makefile.cross-compiles 2>/dev/null || true
 
           # 4. 确保 README_zh.md 保持删除状态（上游可能恢复它）
           if [ -f README_zh.md ]; then
@@ -164,6 +169,7 @@ jobs:
           - 保留自定义 .github/workflows/
           - 保留修改后的 README.md
           - 保留自定义 hack/ci-upload.cjs 上传脚本
+          - 保留精简版 Makefile.cross-compiles
           - 保持 README_zh.md 删除状态
           "
           else
