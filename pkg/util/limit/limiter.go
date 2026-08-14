@@ -1,4 +1,4 @@
-// Copyright 2016 fatedier, fatedier@gmail.com
+// Copyright 2026 The frp Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,10 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package version
+package limit
 
-var version = "0.71.0"
+import (
+	"fmt"
 
-func Full() string {
-	return version
+	"golang.org/x/time/rate"
+)
+
+// NewBandwidthLimiter creates a limiter whose rate preserves the configured
+// byte limit while keeping the burst representable as an int on all targets.
+func NewBandwidthLimiter(bytes int64) *rate.Limiter {
+	if bytes <= 0 {
+		return nil
+	}
+
+	maxInt := int64(^uint(0) >> 1)
+	burst := min(bytes, maxInt)
+	return rate.NewLimiter(rate.Limit(float64(bytes)), int(burst))
+}
+
+func invalidBurstError(burst int) error {
+	return fmt.Errorf("invalid limiter burst: %d", burst)
 }

@@ -35,6 +35,7 @@ import (
 
 	"github.com/fatedier/frp/pkg/auth"
 	v1 "github.com/fatedier/frp/pkg/config/v1"
+	"github.com/fatedier/frp/pkg/config/v1/validation"
 	modelmetrics "github.com/fatedier/frp/pkg/metrics"
 	"github.com/fatedier/frp/pkg/msg"
 	"github.com/fatedier/frp/pkg/nathole"
@@ -791,6 +792,9 @@ func (svr *Service) RegisterControl(
 			return nil, err
 		}
 	}
+	if err := validation.ValidateRunID(loginMsg.RunID); err != nil {
+		return nil, fmt.Errorf("invalid run id: %w", err)
+	}
 
 	ctx := netpkg.NewContextFromConn(ctlConn)
 	xl := xlog.FromContextSafe(ctx)
@@ -885,14 +889,22 @@ func (svr *Service) RegisterWorkConn(
 }
 
 func (svr *Service) RegisterVisitorConn(visitorConn net.Conn, newMsg *msg.NewVisitorConn, wireProtocol string) error {
-	admit := func(visitorUser string) error {
+	admit := func(visitorUser, visitorWireProtocol, visitorUDPPacketCodec string) error {
+		if visitorWireProtocol == "" {
+			visitorWireProtocol = wireProtocol
+		}
 		return svr.rc.VisitorManager.NewConn(newMsg.ProxyName, visitorConn, newMsg.Timestamp, newMsg.SignKey,
-			newMsg.UseEncryption, newMsg.UseCompression, visitorUser, wireProtocol)
+			newMsg.UseEncryption, newMsg.UseCompression, visitorUser, visitorWireProtocol, visitorUDPPacketCodec)
 	}
 	// TODO(deprecation): Compatible with old versions, can be without runID, user is empty. In later versions, it will be mandatory to include runID.
 	// If runID is required, it is not compatible with versions prior to v0.50.0.
 	if newMsg.RunID != "" {
-		admitted, err := svr.ctlManager.admitVisitorByRunID(newMsg.RunID, admit)
+		admitted, err := svr.ctlManager.admitVisitorByRunID(newMsg.RunID, func(visitorUser, controlWireProtocol, controlUDPPacketCodec string) error {
+			if wireProtocol != controlWireProtocol {
+				return fmt.Errorf("visitor connection wire protocol mismatch: got %s want %s", wireProtocol, controlWireProtocol)
+			}
+			return admit(visitorUser, controlWireProtocol, controlUDPPacketCodec)
+		})
 		if err != nil {
 			return err
 		}
@@ -901,5 +913,5 @@ func (svr *Service) RegisterVisitorConn(visitorConn net.Conn, newMsg *msg.NewVis
 		}
 		return nil
 	}
-	return admit("")
+	return admit("", wireProtocol, "")
 }
