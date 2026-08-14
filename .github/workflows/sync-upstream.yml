@@ -27,6 +27,9 @@ name: Sync Upstream Tag
 #     后续 git push origin dev 时即使 --no-follow-tags 也可能批量推送，
 #     与 origin 已有 tag 冲突。改为 git fetch upstream master --no-tags
 #     只拉 master 分支，目标 tag 在 Sync 步骤用 git fetch upstream tag $TAG 单独拉取
+#   - git fetch upstream tag $TAG 在本地已有同名 tag（origin 已同步过，指向不同提交）时报
+#     "would clobber existing tag" 且自动跟随会把上游全部 tag 拉进本地；
+#     改用 git fetch upstream tag $TAG --no-tags --force 强制覆盖且只拉目标 tag
 
 on:
   schedule:
@@ -141,9 +144,10 @@ jobs:
           # 上游无此文件，需备份后还原
           cp Makefile.cross-compiles /tmp/protected/Makefile.cross-compiles 2>/dev/null || true
 
-          # 2. 只 fetch 目标 tag（不拉上游所有 tag，避免 git push 时批量推送冲突）
-          #    git fetch upstream tag $TAG 只在本地创建 refs/tags/$TAG，不影响其他 tag
-          git fetch upstream tag "$TARGET_TAG" --no-recurse-submodules
+          # 2. 只 fetch 目标 tag：--no-tags 关闭自动跟随（不把上游全部 tag 拉进本地 refs/tags/，
+          #    避免 git push 时批量推送冲突），--force 覆盖本地同名 tag（origin 已有该 tag 时
+          #    避免 "would clobber existing tag" 报错）
+          git fetch upstream tag "$TARGET_TAG" --no-recurse-submodules --no-tags --force
 
           # 3. 合并上游 tag 到 dev（-X theirs：冲突时上游获胜）
           #    注意：tag 引用是 refs/tags/$TAG，不是 upstream/$TAG（那是分支引用）
