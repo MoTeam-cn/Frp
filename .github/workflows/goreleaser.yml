@@ -1,6 +1,9 @@
 name: Release
 
-# 通过 tag 推送触发（由 sync-upstream.yml 自动同步上游 tag 后触发，或手动推送 tag）
+# 触发方式：
+#   - workflow_call：由 sync-upstream.yml 同步上游 tag 后调用（推荐路径）
+#   - push.tags：手动推送 v* tag 触发
+#   - workflow_dispatch：手动指定已存在 tag 构建
 # 流程：
 #   1. 构建 frps/frpc web 资产
 #   2. 调用 Makefile.cross-compiles 跨平台编译 frpc + frps 二进制
@@ -12,6 +15,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_call:
+    inputs:
+      tag:
+        description: '要构建的 tag（如 v0.62.0，由 sync-upstream.yml 传入）'
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       tag:
@@ -22,6 +31,7 @@ on:
 env:
   GO_VERSION: '1.25'
   NODE_VERSION: '22'
+  # 仅用于 Summary 展示；脚本读取的 apiServer 地址来自 secrets.MOLAUNCH_ACTION_PUSH_SERVER
   API_BASE_URL: https://api.molaunch.moiu.cn
 
 permissions:
@@ -36,16 +46,15 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # workflow_dispatch 模式下支持指定 tag
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          # workflow_call / workflow_dispatch 模式下支持指定 tag
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Extract version from tag
         id: version
         shell: bash
         run: |
-          if [ -n "${{ github.event.inputs.tag }}" ]; then
-            TAG="${{ github.event.inputs.tag }}"
-          else
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
             TAG="${GITHUB_REF#refs/tags/}"
           fi
           # 去掉 v 前缀
@@ -89,7 +98,7 @@ jobs:
         id: upload
         env:
           MOLAUNCH_ACTION_PUSH_KEY: ${{ secrets.MOLAUNCH_ACTION_PUSH_KEY }}
-          API_BASE_URL: ${{ env.API_BASE_URL }}
+          MOLAUNCH_ACTION_PUSH_SERVER: ${{ secrets.MOLAUNCH_ACTION_PUSH_SERVER }}
         run: |
           VERSION="${{ steps.version.outputs.VERSION }}"
           TAG="${{ steps.version.outputs.TAG }}"

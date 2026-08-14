@@ -1,35 +1,8 @@
 #!/usr/bin/env node
 /**
- * ci-upload.cjs — 上传 frp 单个二进制包到 apiServer（MoSign-v2 鉴权）
- *
- * 纯 Node.js 实现，消除 shell/Node 数据传递导致的签名不一致问题：
- * - JSON.stringify() 生成 body Buffer，签名和 HTTP 请求使用同一个 Buffer
- * - 无 heredoc / curl / shell 变量展开，行为确定
- *
- * 用法：
- *   node ci-upload.cjs <version> <component> <platform> <arch> <file_path> [release_notes] [release_url]
- *
- * 参数：
- *   version        frp 语义化版本号（如 0.70.1）
- *   component      组件类型：client | server
- *   platform       平台：windows | macos | linux
- *   arch           架构：x86_64 | aarch64 | i686 | armv7
- *   file_path      本地压缩包路径
- *   release_notes  可选，更新日志（Markdown）
- *   release_url    可选，GitHub Release 页面 URL
- *
- * 环境变量：
- *   MOLAUNCH_ACTION_PUSH_KEY  MoSign-v2 签名密钥（必填）
- *   API_BASE_URL              apiServer 基础 URL（默认 https://api.molaunch.moiu.cn）
- *
- * 流程：
- *   1. 计算文件大小和 SHA256
- *   2. POST /v3/ci/frp/presign-upload 获取 S3 预签名 PUT URL
- *   3. PUT 直传文件到 S3
- *   4. POST /v3/ci/frp/releases 注册版本到 apiServer
- *
- * See: api-server/src/utils/mosign_v2.rs（签名协议）
- *      api-server/src/controllers/v3/ci.rs（frp_presign_upload + create_frp_release）
+ * ci-upload.cjs — 上传 frp 单个二进制包到 apiServer（MoSign-v2 鉴权，纯 Node 实现）
+ * 用法: node ci-upload.cjs <version> <component> <platform> <arch> <file_path> [release_notes] [release_url]
+ * 环境变量: MOLAUNCH_ACTION_PUSH_KEY（必填）/ MOLAUNCH_ACTION_PUSH_SERVER（必填，apiServer 地址）
  */
 
 'use strict';
@@ -64,10 +37,14 @@ const FILE_PATH = args[4];
 const RELEASE_NOTES = args[5] || '';
 const RELEASE_URL = args[6] || '';
 
-const API_BASE_URL = process.env.API_BASE_URL || 'https://api.molaunch.moiu.cn';
+const API_BASE_URL = process.env.MOLAUNCH_ACTION_PUSH_SERVER;
 const PUSH_KEY = process.env.MOLAUNCH_ACTION_PUSH_KEY;
 
 // ===== 环境校验 =====
+if (!API_BASE_URL) {
+  console.error('::error::MOLAUNCH_ACTION_PUSH_SERVER 环境变量未设置');
+  process.exit(1);
+}
 if (!PUSH_KEY) {
   console.error('::error::MOLAUNCH_ACTION_PUSH_KEY 环境变量未设置');
   process.exit(1);
@@ -76,8 +53,6 @@ if (!fs.existsSync(FILE_PATH)) {
   console.error(`::error::文件不存在: ${FILE_PATH}`);
   process.exit(1);
 }
-
-// 参数校验
 if (!['client', 'server'].includes(COMPONENT)) {
   console.error(`::error::component 非法（仅 client / server）: ${COMPONENT}`);
   process.exit(1);
@@ -112,9 +87,9 @@ function httpRequest(targetUrl, options, body) {
     if (body) headers['Content-Length'] = Buffer.byteLength(body);
 
     const req = lib.request(u, { method: options.method, headers }, (res) => {
-      // 处理 3xx 重定向（S3 可能返回 307 临时重定向）
+      // 3xx 重定向（S3 307）
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        res.resume(); // 丢弃当前响应体
+        res.resume();
         httpRequest(res.headers.location, options, body).then(resolve, reject);
         return;
       }
@@ -124,10 +99,146 @@ function httpRequest(targetUrl, options, body) {
         resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) });
       });
     });
-    req.on('error', reject);
+    req.on('error', (err) => {
+      err.networkError = true;
+      reject(err);
+    });
     if (body) req.write(body);
     req.end();
   });
+}
+
+// ===== S3 上传辅助 =====
+
+// Cloudflare 回源源站错误码（520~527、530）自动重试，403 等鉴权错误不重试
+const RETRYABLE_STATUS = new Set([520, 521, 522, 523, 524, 525, 526, 527, 530]);
+const MAX_RETRIES = 3;
+
+async function s3PutWithRetry(uploadUrl, buffer, label) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const resp = await httpRequest(uploadUrl, { method: 'PUT', headers: {} }, buffer);
+      if (resp.status >= 200 && resp.status < 300) return resp;
+      const err = new Error(`${label} S3 上传失败 (HTTP ${resp.status}): ${resp.body.toString().slice(0, 500)}`);
+      err.code = 'UPLOAD_FAILED';
+      err.httpStatus = resp.status;
+      throw err;
+    } catch (err) {
+      const retryable = err.code === 'UPLOAD_FAILED' && RETRYABLE_STATUS.has(err.httpStatus)
+        || err.networkError;
+      if (!retryable || attempt > MAX_RETRIES) throw err;
+      const delay = Math.min(1000 * 2 ** (attempt - 1), 8000);
+      console.log(`::warning::${label} 上传失败 (${err.httpStatus ? `HTTP ${err.httpStatus}` : err.code})，${delay}ms 后第 ${attempt} 次重试（共最多 ${MAX_RETRIES} 次）...`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}
+
+// 单次 PUT 上传（小文件）
+function uploadSingle(item, buffer, label) {
+  return s3PutWithRetry(item.upload_url, buffer, label);
+}
+
+// MoSign-v2 API POST（签名 + 请求 + Cloudflare 回源错误重试）
+// 与 s3PutWithRetry 同一套 RETRYABLE_STATUS / MAX_RETRIES 退避策略，
+// 每次尝试重新签名（timestamp/nonce 每次生成）
+async function apiPostWithRetry(reqPath, bodyBuffer, label) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const sign = signRequest('POST', reqPath, bodyBuffer);
+      const resp = await httpRequest(`${API_BASE_URL}${reqPath}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-MoSign-Version': 'MoSign-v2',
+          'X-MoSign-Timestamp': sign.timestamp,
+          'X-MoSign-Nonce': sign.nonce,
+          'X-MoSign-Signature': sign.signature,
+        },
+      }, bodyBuffer);
+      if (resp.status >= 200 && resp.status < 300) return resp;
+      const err = new Error(`${label} API 请求失败 (HTTP ${resp.status}): ${resp.body.toString().slice(0, 500)}`);
+      err.code = 'API_FAILED';
+      err.httpStatus = resp.status;
+      throw err;
+    } catch (err) {
+      const retryable = err.code === 'API_FAILED' && RETRYABLE_STATUS.has(err.httpStatus)
+        || err.networkError;
+      if (!retryable || attempt > MAX_RETRIES) throw err;
+      const delay = Math.min(1000 * 2 ** (attempt - 1), 8000);
+      console.log(`::warning::${label} API 请求失败 (${err.httpStatus ? `HTTP ${err.httpStatus}` : err.code})，${delay}ms 后第 ${attempt} 次重试（共最多 ${MAX_RETRIES} 次）...`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}
+
+// 分片上传（大文件）：按 part_number 顺序 PUT 各分片，收集 ETag
+async function uploadMultipart(item, buffer, label) {
+  const { upload_id, part_size, parts } = item.multipart;
+  console.log(`${label}分片上传开始: ${parts.length} 片 x ${part_size} 字节 (upload_id=${upload_id})`);
+  const uploadedParts = [];
+  for (const part of parts) {
+    const start = (part.part_number - 1) * part_size;
+    const end = Math.min(start + part_size, buffer.length);
+    const chunk = buffer.subarray(start, end);
+    const resp = await s3PutWithRetry(part.upload_url, chunk, `${label} 分片 ${part.part_number}`);
+    const etag = resp.headers.etag;
+    if (!etag) {
+      const err = new Error(`${label} 分片 ${part.part_number} 响应缺少 ETag`);
+      err.code = 'UPLOAD_FAILED';
+      throw err;
+    }
+    uploadedParts.push({ part_number: part.part_number, etag });
+    console.log(`  分片 ${part.part_number}/${parts.length} 完成 (${chunk.length} bytes)`);
+  }
+  return uploadedParts;
+}
+
+// 回传 upload_id + 分片 ETag 列表，由服务端合并
+// updater 与 frp 两类对象共用 /v3/ci/complete-upload（download_key 区分）
+async function completeMultipartUpload(item, parts) {
+  const completePath = '/v3/ci/complete-upload';
+  const completeBody = Buffer.from(JSON.stringify({
+    upload_id: item.multipart.upload_id,
+    download_key: item.download_key,
+    parts,
+  }));
+  console.log('完成分片上传（CompleteMultipartUpload）...');
+
+  const resp = await apiPostWithRetry(completePath, completeBody, '完成分片');
+
+  let data;
+  try {
+    data = JSON.parse(resp.body.toString());
+  } catch (e) {
+    const err = new Error(`完成分片响应非 JSON（HTTP ${resp.status}）: ${resp.body.toString().slice(0, 500)}`);
+    err.code = 'UPLOAD_FAILED';
+    throw err;
+  }
+
+  if (data.code !== 1) {
+    const err = new Error(`完成分片失败 (code=${data.code}): ${data.msg || ''}\n完整响应：${resp.body.toString()}`);
+    err.code = 'UPLOAD_FAILED';
+    throw err;
+  }
+  console.log('分片上传完成');
+}
+
+// 有 multipart 凭证走分片，否则单次 PUT
+async function uploadToS3(item, buffer, label) {
+  if (item.multipart && item.multipart.parts && item.multipart.parts.length > 0) {
+    const parts = await uploadMultipart(item, buffer, label);
+    await completeMultipartUpload(item, parts);
+    return;
+  }
+  if (!item.upload_url) {
+    const err = new Error(`${label} 预签名响应缺少 upload_url 且无分片凭证`);
+    err.code = 'UPLOAD_FAILED';
+    throw err;
+  }
+  console.log(`上传${label}: -> S3`);
+  await uploadSingle(item, buffer, label);
+  console.log(`${label}上传完成`);
 }
 
 // ===== 主流程 =====
@@ -135,34 +246,24 @@ async function main() {
   const FILENAME = path.basename(FILE_PATH);
   const fileBuffer = fs.readFileSync(FILE_PATH);
   const FILE_SIZE = fileBuffer.length;
-  const FILE_SHA256 = crypto.createHash('sha256').update(fileBuffer).digest('hex');
-  const FILE_HASH = `sha256:${FILE_SHA256}`;
+  const FILE_HASH = `sha256:${crypto.createHash('sha256').update(fileBuffer).digest('hex')}`;
 
   console.log(`::group::上传 ${COMPONENT} ${VERSION} ${PLATFORM}/${ARCH} (${FILENAME}, ${FILE_SIZE} bytes)`);
 
-  // ===== Step 1: 获取 S3 预签名 PUT URL =====
-  // body 用 JSON.stringify 生成，签名和请求共用同一个 Buffer，保证 SHA256 一致
+  // ===== Step 1: 获取 S3 预签名上传 URL =====
   const presignPath = '/v3/ci/frp/presign-upload';
   const presignBody = Buffer.from(JSON.stringify({
     version: VERSION,
     component: COMPONENT,
     platform: PLATFORM,
     filenames: [FILENAME],
+    // 服务端据此判断是否分片（超过分片阈值返回 multipart 凭证）
+    sizes: [FILE_SIZE],
   }));
 
-  const presignSign = signRequest('POST', presignPath, presignBody);
   console.log('请求预签名上传 URL...');
 
-  const presignResp = await httpRequest(`${API_BASE_URL}${presignPath}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-MoSign-Version': 'MoSign-v2',
-      'X-MoSign-Timestamp': presignSign.timestamp,
-      'X-MoSign-Nonce': presignSign.nonce,
-      'X-MoSign-Signature': presignSign.signature,
-    },
-  }, presignBody);
+  const presignResp = await apiPostWithRetry(presignPath, presignBody, '预签名');
 
   let presignData;
   try {
@@ -172,7 +273,6 @@ async function main() {
     process.exit(1);
   }
 
-  // HTTP 200 + body.code 区分业务错误（code=1004 签名校验失败等）
   if (presignData.code !== 1) {
     console.error(`::error::预签名业务错误 (code=${presignData.code}): ${presignData.msg || ''}`);
     console.error(`完整响应：${presignResp.body.toString()}`);
@@ -185,25 +285,11 @@ async function main() {
   }
 
   const uploadItem = presignData.data.uploads[0];
-  const UPLOAD_URL = uploadItem.upload_url;
-  const DOWNLOAD_KEY = uploadItem.download_key;
   console.log(`已获取预签名 URL（有效期 ${presignData.data.expires_in} 秒）`);
-  console.log(`  download_key: ${DOWNLOAD_KEY}`);
+  console.log(`  download_key: ${uploadItem.download_key}`);
 
-  // ===== Step 2: 上传文件到 S3 =====
-  console.log(`上传 ${FILE_PATH} -> S3 (key=${DOWNLOAD_KEY})`);
-  const s3Resp = await httpRequest(UPLOAD_URL, {
-    method: 'PUT',
-    // S3 presigned URL 只签了 host 头，不要额外设置 Content-Type 等头
-    headers: {},
-  }, fileBuffer);
-
-  if (s3Resp.status < 200 || s3Resp.status >= 300) {
-    console.error(`::error::S3 上传失败 (HTTP ${s3Resp.status})`);
-    console.error(s3Resp.body.toString().slice(0, 500));
-    process.exit(1);
-  }
-  console.log('S3 上传完成');
+  // ===== Step 2: 上传文件到 S3（大文件走分片上传，小文件单次 PUT） =====
+  await uploadToS3(uploadItem, fileBuffer, '压缩包');
 
   // ===== Step 3: 注册版本到 apiServer =====
   const releasePath = '/v3/ci/frp/releases';
@@ -212,7 +298,7 @@ async function main() {
     component: COMPONENT,
     platform: PLATFORM,
     arch: ARCH,
-    download_url: DOWNLOAD_KEY,
+    download_url: uploadItem.download_key,
     signature: '',
     file_size: FILE_SIZE,
     file_hash: FILE_HASH,
@@ -221,19 +307,9 @@ async function main() {
     rollout_pct: 100,
   }));
 
-  const releaseSign = signRequest('POST', releasePath, releaseBody);
   console.log('注册版本到 apiServer...');
 
-  const releaseResp = await httpRequest(`${API_BASE_URL}${releasePath}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-MoSign-Version': 'MoSign-v2',
-      'X-MoSign-Timestamp': releaseSign.timestamp,
-      'X-MoSign-Nonce': releaseSign.nonce,
-      'X-MoSign-Signature': releaseSign.signature,
-    },
-  }, releaseBody);
+  const releaseResp = await apiPostWithRetry(releasePath, releaseBody, '注册版本');
 
   let releaseData;
   try {

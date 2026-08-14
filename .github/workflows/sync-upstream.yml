@@ -11,7 +11,7 @@ name: Sync Upstream Tag
 #      - Makefile.cross-compiles   自定义跨平台编译目标（精简版）
 #   3. 主分支 dev 通过 merge -X theirs 合并上游代码，冲突时上游获胜，
 #      但受保护文件在合并后强制还原为本仓库版本
-#   4. 同步完成后 push dev 和 tag，并主动触发 goreleaser.yml 构建工作流
+#   4. 同步完成后 push dev 和 tag，并通过 workflow_call 调用 goreleaser.yml 构建工作流
 #   注：MoTeam-cn/Frp 默认分支为 dev（不是 main）
 #
 # Bug 修复记录：
@@ -22,7 +22,7 @@ name: Sync Upstream Tag
 #   - git merge upstream/$TAG 不正确（upstream/ 前缀用于分支不用于 tag），
 #     改用 git merge refs/tags/$TAG
 #   - GITHUB_TOKEN 推送的 tag 不会触发其他工作流的 on.push 事件
-#     （GitHub 防递归机制），改用 gh workflow run 主动触发 goreleaser.yml
+#     （GitHub 防递归机制），改为同运行内通过 workflow_call 调用 goreleaser.yml
 #   - git fetch upstream --tags 会把上游所有 tag 拉到本地 refs/tags/，
 #     后续 git push origin dev 时即使 --no-follow-tags 也可能批量推送，
 #     与 origin 已有 tag 冲突。改为 git fetch upstream master --no-tags
@@ -46,13 +46,14 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  # actions: write 用于 gh workflow run 主动触发 goreleaser.yml
-  actions: write
 
 jobs:
   sync:
     name: Sync upstream tag
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.target.outputs.tag }}
+      should_sync: ${{ steps.target.outputs.should_sync }}
     steps:
       - name: Checkout MoTeam-cn/Frp
         uses: actions/checkout@v4
@@ -196,32 +197,6 @@ jobs:
           echo "::endgroup::"
           echo "::notice::同步完成：dev + tag $TARGET_TAG 已推送"
 
-      - name: Trigger goreleaser build workflow
-        if: steps.target.outputs.should_sync == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TARGET_TAG="${{ steps.target.outputs.tag }}"
-          echo "::group::主动触发 goreleaser.yml 构建工作流"
-          echo "原因：GITHUB_TOKEN 推送的 tag 不会触发其他工作流的 on.push 事件（GitHub 防递归机制）"
-          echo "目标 tag：$TARGET_TAG"
-
-          # 等待 10 秒，确保 tag 引用已在 GitHub 服务端可见
-          sleep 10
-
-          # 通过 workflow_dispatch 主动触发构建
-          # -f tag=$TARGET_TAG：将 tag 作为输入传递，goreleaser.yml 会 checkout 该 tag
-          if gh workflow run goreleaser.yml \
-            --ref dev \
-            -f tag="$TARGET_TAG"; then
-            echo "::notice::已触发 goreleaser.yml 工作流（tag=$TARGET_TAG）"
-            echo "查看构建进度：https://github.com/${{ github.repository }}/actions/workflows/goreleaser.yml"
-          else
-            echo "::error::触发 goreleaser.yml 工作流失败"
-            exit 1
-          fi
-          echo "::endgroup::"
-
       - name: Summary
         if: always()
         run: |
@@ -230,9 +205,20 @@ jobs:
           if [ "${{ steps.target.outputs.should_sync }}" = "true" ]; then
             echo "✅ 已同步上游 tag \`${{ steps.target.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "下一步：已通过 \`gh workflow run\` 主动触发 [\`goreleaser.yml\`](./goreleaser.yml) 工作流构建并上传到 apiServer" >> $GITHUB_STEP_SUMMARY
+            echo "下一步：已通过 \`workflow_call\` 触发 [\`goreleaser.yml\`](./goreleaser.yml) 工作流构建并上传到 apiServer" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "查看构建进度：[Actions](https://github.com/${{ github.repository }}/actions/workflows/goreleaser.yml)" >> $GITHUB_STEP_SUMMARY
           else
             echo "ℹ️ 无需同步（tag 已存在或未找到上游新 tag）" >> $GITHUB_STEP_SUMMARY
           fi
+
+  # 有 tag 要构建时激活构建工作流；tag 由 sync job 解析后传入。
+  # 可复用工作流必须在 job 级通过 uses 调用（step 级 uses 只接受本地 action 目录）。
+  release:
+    name: Trigger Release
+    needs: sync
+    if: needs.sync.outputs.should_sync == 'true'
+    uses: ./.github/workflows/goreleaser.yml
+    with:
+      tag: ${{ needs.sync.outputs.tag }}
+    secrets: inherit
